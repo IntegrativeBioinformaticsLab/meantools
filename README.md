@@ -31,39 +31,16 @@ and weight tables retain the original identifiers.
 
 See [ranking conventions, rerun commands, and validation](docs/mutual_rank_correction.md).
 
-# HPC execution
+# HPC implementation
 
-The `HPC/` directory provides a single-node SLURM implementation for larger
-correlation and mutual-rank analyses. It follows the same filtering, automatic
-network selection, corrected ranking, weighting and ClusterONE conventions as
-the standard `corrMultiomics.py` runner.
+The `HPC/` scripts add block-based correlation calculations, controlled
+threading, streamed SQLite output, and disk or RAM storage for mutual ranks.
+These changes reduce per-pair processing overhead and control intermediate
+memory use, helping larger analyses run on a single HPC node. Both storage
+modes follow the corrected mutual-rank conventions used by the standard runner.
 
-| Script | Purpose |
-| --- | --- |
-| [corrMultiomics_HPC.py](HPC/corrMultiomics_HPC.py) | Computes correlations in blocks using a bounded thread pool, streams results into SQLite, and calculates mutual ranks using scratch-disk or RAM storage. |
-| [corrMultiomics.sh](HPC/corrMultiomics.sh) | Submits the Python runner through SLURM, configures CPU/thread limits, creates job-local scratch space, and gives each job a separate output database. |
+The included SLURM submission script manages resource settings, temporary
+scratch files and separate output databases for each job.
 
-Keep `HPC/` inside the MEANtools checkout so the runner can import the shared
-`mutual_ranks.py`. The Python dependencies are NumPy, SciPy, pandas and
-`threadpoolctl`; disk ranking requires SQLite >=3.25. ClusterONE requires Java
-and the bundled `cluster_one-1.0.jar`.
-
-Before submitting, edit the paths, environment activation, account, partition,
-CPU, memory and time settings in `HPC/corrMultiomics.sh` for your cluster:
-
-```bash
-# Default: store mutual-rank intermediates on scratch disk.
-sbatch HPC/corrMultiomics.sh
-
-# Alternatively, use RAM with an estimated working-memory budget of 20 GiB.
-sbatch --export=ALL,MR_STORAGE=ram,MR_MEMORY_GB=20 HPC/corrMultiomics.sh
-```
-
-The RAM budget must fit within the job's memory allocation; it does not request
-additional memory from SLURM. Both modes write results to SQLite and require a
-new output database for MR construction. As with the standard runner, use the
-same matrix file for both `-ft` and `-qm` for a unimodal network, or separate
-input files for a bipartite network.
-
-See the [HPC documentation](HPC/README.md) for direct Python usage, resource
-controls, output tables and validation details.
+See the [HPC README](HPC/README.md) for implementation details, requirements
+and usage examples.
