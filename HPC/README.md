@@ -79,8 +79,10 @@ managers, forked worker copies, or concurrent database writers.
 
 Both MR backends rank retained edges directly, avoiding all-node combinations.
 The disk backend uses SQL grouping, window ranks and a reciprocal join. The RAM
-backend sorts compact arrays, deduplicates before rank assignment and aligns
-reciprocal ranks. RAM planning uses the existing estimate of 256 bytes per
+backend sorts numeric column keys, deduplicates before rank assignment and
+scatters partner ranks back to canonical edge positions. This avoids repeated
+structured-record sorts and a separate reverse-edge join. RAM planning uses
+the existing estimate of 256 bytes per
 retained input edge plus 128 MiB; this is an estimate, not a hard RSS limit.
 Input edge counts include reverse and diagonal records before cleanup. If no
 explicit RAM budget is set, a positive numeric `SLURM_MEM_PER_NODE` supplies a
@@ -91,6 +93,49 @@ heap settings affect resource use. Scratch sorting may need substantial local
 space. Stage timings and block progress are logged. The reader additionally
 recognizes semicolon text CSVs and reports malformed/archived input errors.
 No GPU or multi-node distribution is implemented.
+
+## Selecting RAM mode and diagnosing disk activity
+
+The submission wrapper passes the storage mode exactly once, using
+`MR_STORAGE` (default `disk`). Select RAM when submitting:
+
+```bash
+sbatch --export=ALL,MR_STORAGE=ram HPC/corrMultiomics.sh
+```
+
+For a direct Python invocation, supply `--mr-storage ram` once. In older
+wrappers, a command containing `--mr-storage ram` followed by `"${mr_args[@]}"`
+could also include the array's default `--mr-storage disk`. Python's default
+argument handling silently used that later value. The updated parser rejects
+conflicting repeated storage options before reading data or creating output.
+Update both HPC files in the cluster installation before resubmitting.
+
+Startup logs identify the actual runner path and SHA256, selected network type,
+effective storage mode, memory budget and output paths. In RAM mode, the log
+states that NumPy arrays are used and no scratch ranking database is opened.
+Only disk mode opens `ranks.sqlite`. A growing `ranks.sqlite` therefore indicates
+disk ranking or an older installed script, rather than RAM automatically
+spilling to disk. Exceeding the RAM budget raises an error; it does not change
+backends.
+
+RAM mode still writes persistent correlations, MRs and weights to the output
+SQLite database and creates edge files for ClusterONE. Those output writes
+remain disk I/O. For disk ranking, use node-local scratch when your cluster
+provides it; if a path under `/nobackup/beegfs` is shared storage, large SQLite
+sorts and intermediate writes can be limited by that filesystem. Journaling
+and synchronous writes are disabled only for the disposable scratch ranking
+database; output-database durability settings are preserved.
+
+For unimodal coexpression, pass the **same chosen transcript file** to both
+`-ft` and `-qm`. Two separately named files, such as `expression_2.csv` and
+`expression.csv`, select bipartite handling even if their contents are equal.
+The startup network-type log makes this distinction visible.
+
+A local ranking-only benchmark with 3,000 nodes and 7,201,814 synthetic input
+records took 18.6 seconds with the previous RAM sorter and 5.3 seconds with the
+numeric-key implementation (about 3.5-fold faster). Forward and reciprocal
+rank arrays were exactly equal. These timings exclude correlation calculation,
+SQLite output and ClusterONE and do not predict full-job runtime on SLURM.
 
 ## Outputs
 
@@ -152,6 +197,9 @@ symmetric/repeated/shuffled edges, self-pairs, tied/negative correlations,
 duplicate tolerance/conflicts, empty graphs and overlapping bipartite names.
 They also exercise filtering order, log handling, streaming, provenance,
 RAM budgets, database preservation and Spearman's correlation-only behavior.
+Storage-selection tests execute the wrapper with site commands stubbed, reject
+conflicting options, and trace database connections to verify that RAM mode
+opens only the persistent output database and never the scratch rank database.
 In a full MEANtools environment, integration tests run the actual standard and
 HPC CLIs, compare correlations/MRs/weights, and compare real ClusterONE member
 sets for both network types, both storage backends and both decay-rate paths.

@@ -1,6 +1,7 @@
 """Numerical and streamed-pipeline parity tests for the HPC runner."""
 import importlib.util
 import hashlib
+import io
 import json
 import os
 import sqlite3
@@ -52,6 +53,73 @@ def run_ranks(data, nodes, storage, network_type='unimodal', **settings):
 
 
 class NumericalTests(unittest.TestCase):
+    def test_submission_wrapper_passes_storage_once(self):
+        # Execute the real wrapper with site commands stubbed: no job is
+        # submitted and no installation/input/output paths are accessed.
+        with tempfile.TemporaryDirectory() as tmp:
+            captured = Path(tmp)/'arguments'
+            shell = '''
+module() { :; }
+mamba() { :; }
+srun() { printf '%s\\0' "$@" > "$CAPTURED_ARGUMENTS"; }
+source "$WRAPPER_PATH"
+'''
+            for mode, budget in [('ram',''),('disk','1')]:
+                env = os.environ.copy()
+                env.update(MR_STORAGE=mode, MR_MEMORY_GB=budget, SLURM_JOB_ID='test',
+                           SLURM_JOB_NODELIST='localhost', SLURM_CPUS_PER_TASK='1',
+                           SLURM_TMPDIR=tmp, CAPTURED_ARGUMENTS=str(captured),
+                           WRAPPER_PATH=str(SCRIPT.with_name('corrMultiomics.sh')))
+                run = subprocess.run(['bash','-c',shell],env=env,capture_output=True,text=True)
+                self.assertEqual(run.returncode,0,run.stdout+run.stderr)
+                arguments = captured.read_bytes().decode().rstrip('\0').split('\0')
+                self.assertEqual(arguments.count('--mr-storage'),1)
+                self.assertEqual(arguments[arguments.index('--mr-storage')+1],mode)
+                self.assertEqual('--mr-memory-gb' in arguments,bool(budget))
+                self.assertIn('MR_STORAGE='+mode,run.stdout)
+                self.assertEqual(list(Path(tmp).glob('corrMO.*')),[])
+
+    def test_storage_selection_rejects_conflicting_repeated_options(self):
+        required = ['corrMultiomics_HPC.py', '-ft', 'x.csv', '-qm', 'x.csv',
+                    '-dn', 'out.sqlite', '-tn', 'test']
+        for first, second in [('ram','disk'), ('disk','ram')]:
+            stderr = io.StringIO()
+            with patch.object(sys, 'argv', required + ['--mr-storage',first,'--mr-storage',second]), \
+                    patch('sys.stderr', stderr), self.assertRaises(SystemExit) as error:
+                hpc.get_args()
+            self.assertEqual(error.exception.code, 2)
+            self.assertIn('Conflicting --mr-storage', stderr.getvalue())
+        for extra, expected in [([], 'disk'), (['--mr-storage','ram'], 'ram'),
+                                (['--mr-storage=ram','--mr-storage','ram'], 'ram')]:
+            with patch.object(sys, 'argv', required + extra):
+                parsed = hpc.get_args()
+            self.assertEqual(parsed.mr_storage, expected)
+            self.assertNotIn('_explicit_mr_storage', vars(parsed))
+
+    def test_ram_mode_opens_only_the_output_database(self):
+        rng = np.random.RandomState(49)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp)/'input.csv'
+            pd.DataFrame(rng.randn(4,12), index=list('ABCD')).to_csv(path)
+            database = str(Path(tmp)/'output.sqlite')
+            opt = options(feature_table=path, quantitation_matrix=path,
+                          sqlite_db_name=database, mr_storage='ram', scratch_dir=tmp)
+            original_connect = sqlite3.connect
+            opened, statements = [], []
+            def tracked_connect(name, *args, **kwargs):
+                opened.append(str(name))
+                if Path(str(name)).name == 'ranks.sqlite':
+                    self.fail('RAM mode opened a disk ranking database')
+                connection = original_connect(name, *args, **kwargs)
+                connection.set_trace_callback(statements.append)
+                return connection
+            with patch.object(hpc.sqlite3,'connect',side_effect=tracked_connect), \
+                    patch.object(hpc,'mutual_rank',side_effect=AssertionError('RAM switched to disk')):
+                hpc.main(opt)
+            self.assertEqual(opened,[database])
+            self.assertFalse(any('PRAGMA synchronous=OFF' in sql or 'PRAGMA journal_mode=OFF' in sql
+                                 for sql in statements))
+
     def test_methods_match_scipy(self):
         rng = np.random.RandomState(22)
         raw_x, raw_y = rng.rand(7, 13) + .1, rng.rand(11, 13) + .1

@@ -13,7 +13,7 @@ import subprocess
 import zipfile
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import contextmanager
+from contextlib import contextmanager, ExitStack
 from datetime import datetime, timezone
 from urllib.parse import quote as escape_identifier
 
@@ -30,6 +30,17 @@ try:
     from threadpoolctl import threadpool_limits
 except ImportError:
     raise SystemExit("Missing threadpoolctl. Install in the active environment: python -m pip install threadpoolctl")
+
+class StorageModeAction(argparse.Action):
+    """Do not silently override a requested backend with a wrapper's default."""
+    def __call__(self, parser, namespace, value, option_string=None):
+        previous = getattr(namespace, '_explicit_mr_storage', None)
+        if previous is not None and previous != value:
+            parser.error(f'Conflicting --mr-storage values: {previous} and {value}. '
+                         'Supply the option once; check MR_STORAGE and the submission script arguments.')
+        setattr(namespace, '_explicit_mr_storage', value)
+        setattr(namespace, self.dest, value)
+
 
 def get_args():
     parser = argparse.ArgumentParser(prog='corrMultiomics',
@@ -57,7 +68,7 @@ def get_args():
     optional.add_argument('-t', '--threads', default=int(os.environ.get('SLURM_CPUS_PER_TASK', '1')), type=int, required=False)
     optional.add_argument('-v','--verbose', default=False, action='store_true', required=False)
     optional.add_argument('--block-size', type=int, default=128, help='Feature rows per correlation block.')
-    optional.add_argument('--mr-storage', choices=['ram', 'disk'], default='disk',
+    optional.add_argument('--mr-storage', choices=['ram', 'disk'], default='disk', action=StorageModeAction,
                           help='Mutual-rank intermediate storage: NumPy RAM arrays or scratch SQLite (default).')
     optional.add_argument('--mr-memory-gb', type=float, default=None,
                           help='RAM-mode estimated working-memory budget in GiB; defaults to 60%% of SLURM_MEM_PER_NODE when set.')
@@ -65,7 +76,9 @@ def get_args():
     optional.add_argument('--clusterone-jar', default=str(next((base / 'cluster_one-1.0.jar' for base in (Path(__file__).resolve().parent, Path(__file__).resolve().parents[1]) if (base / 'cluster_one-1.0.jar').is_file()), Path(__file__).resolve().parent / 'cluster_one-1.0.jar')))
     optional.add_argument('--java-heap', default='8g', help='ClusterOne Java maximum heap; leave room in the SLURM memory allocation.')
     optional.add_argument('--if-exists', choices=['fail', 'append', 'replace'], default='fail', help='Correlation-only table collisions; MR runs always require a new database.')
-    return parser.parse_args()
+    options = parser.parse_args()
+    vars(options).pop('_explicit_mr_storage', None)
+    return options
 
 
 
@@ -324,7 +337,13 @@ def check_ram_budget(edge_count, budget_gb):
 
 
 def rank_edges_ram(edge_chunks, network_type):
-    """Apply the shared policy with compact NumPy arrays instead of SQL."""
+    """Rank numeric keys and scatter ranks back to canonical edge order.
+
+    lexsort works on primitive numeric columns; sorting structured records by
+    several fields repeatedly is substantially slower at millions of edges.
+    Keep each reciprocal edge at its original array position so neither a
+    second rank-order sort nor a reverse-edge join is needed.
+    """
     count = sum(len(chunk) for chunk in edge_chunks)
     edges = np.empty(count, dtype=EDGE_DTYPE)
     offset = 0
@@ -339,18 +358,23 @@ def rank_edges_ram(edge_chunks, network_type):
         edges['b'] = np.maximum(edges['a'], edges['b'])
         edges['a'] = a
         del a
-    edges.sort(order=['a', 'b', 'correlation'])
-    if len(edges):
-        starts = np.r_[0, np.flatnonzero((edges['a'][1:] != edges['a'][:-1]) |
-                                        (edges['b'][1:] != edges['b'][:-1])) + 1]
-        stops = np.r_[starts[1:], len(edges)]
-        low, high = edges['correlation'][starts], edges['correlation'][stops-1]
-        conflicts = high-low > mutual_ranks.DUPLICATE_ATOL + mutual_ranks.DUPLICATE_RTOL * np.maximum(abs(low), abs(high))
-        if conflicts.any():
-            examples = [(int(edges['a'][i]), int(edges['b'][i]), float(lo), float(hi))
-                        for i, lo, hi in zip(starts[conflicts][:10], low[conflicts][:10], high[conflicts][:10])]
-            raise ValueError(f'Conflicting duplicate correlation scores (first 10): {examples}')
-        edges = edges[stops-1]  # deterministic maximum score per pair
+    with stage(f'RAM pair cleanup: {len(edges):,} non-self input edges'):
+        order = np.lexsort((edges['b'], edges['a']))
+        edges = edges[order]
+        del order
+        if len(edges):
+            starts = np.r_[0, np.flatnonzero((edges['a'][1:] != edges['a'][:-1]) |
+                                            (edges['b'][1:] != edges['b'][:-1])) + 1]
+            low = np.minimum.reduceat(edges['correlation'], starts)
+            high = np.maximum.reduceat(edges['correlation'], starts)
+            conflicts = high-low > mutual_ranks.DUPLICATE_ATOL + mutual_ranks.DUPLICATE_RTOL * np.maximum(abs(low), abs(high))
+            if conflicts.any():
+                examples = [(int(edges['a'][i]), int(edges['b'][i]), float(lo), float(hi))
+                            for i, lo, hi in zip(starts[conflicts][:10], low[conflicts][:10], high[conflicts][:10])]
+                raise ValueError(f'Conflicting duplicate correlation scores (first 10): {examples}')
+            edges = edges[starts]
+            edges['correlation'] = high  # same deterministic representative as the disk backend
+            del starts, low, high, conflicts
     count = len(edges)
     directed = np.empty(2 * count, dtype=RANK_DTYPE)
     directed['node'][:count], directed['neighbor'][:count] = edges['a'], edges['b']
@@ -358,22 +382,21 @@ def rank_edges_ram(edge_chunks, network_type):
     directed['score'][:count] = directed['score'][count:] = -edges['correlation']
     directed['rank'] = 0
     del edges
-    directed.sort(order=['node', 'score', 'neighbor', 'rank'], kind='quicksort')
-    boundaries = np.r_[0, np.flatnonzero(directed['node'][1:] != directed['node'][:-1]) + 1, len(directed)]
-    for start, stop in zip(boundaries[:-1], boundaries[1:]):
-        directed['rank'][start:stop] = np.arange(1, stop - start + 1)
-    # Each partner occurs once; align reciprocal ranks by canonical edge IDs.
-    directed.sort(order=['node', 'neighbor', 'rank', 'score'], kind='quicksort')
-    forward = directed[directed['node'] < directed['neighbor']]
-    backward = directed[directed['node'] > directed['neighbor']]
-    del directed
-    # Align the reverse ranks to the canonical forward (smaller ID, larger ID).
-    swap = backward['node'].copy()
-    backward['node'] = backward['neighbor']
-    backward['neighbor'] = swap
-    del swap
-    backward.sort(order=['node', 'neighbor', 'rank', 'score'], kind='quicksort')
-    return forward, backward
+    with stage(f'RAM partner ranking: {count:,} distinct pairs'):
+        if count:
+            order = np.lexsort((directed['neighbor'], directed['score'], directed['node']))
+            ordered_nodes = directed['node'][order]
+            starts = np.r_[0, np.flatnonzero(ordered_nodes[1:] != ordered_nodes[:-1]) + 1]
+            sizes = np.diff(np.r_[starts, len(order)])
+            ranks = np.arange(1, len(order)+1, dtype=np.int64) - np.repeat(starts, sizes)
+            directed['rank'][order] = ranks
+            del order, ordered_nodes, starts, sizes, ranks
+    # Both halves still follow the same canonical pair order. Restore canonical
+    # node/neighbor columns in the reverse half, keeping the reverse ranks.
+    swap = directed['node'][count:].copy()
+    directed['node'][count:] = directed['neighbor'][count:]
+    directed['neighbor'][count:] = swap
+    return directed[:count], directed[count:]
 
 
 def ram_rank_chunks(edge_chunks, options):
@@ -403,6 +426,11 @@ def main(options):
         raise FileExistsError('MR construction requires a new output database; preserve the existing database.')
     options.network_type = mutual_ranks.network_type_from_inputs(options.feature_table, options.quantitation_matrix)
     do_mr = options.mutual_rank and options.method != 'spearman'
+    if options.mr_storage not in ('ram', 'disk'):
+        raise ValueError('--mr-storage must be ram or disk')
+    log(f'Runner={Path(__file__).resolve()}; SHA256={file_sha256(__file__)}')
+    log(f'Network type={options.network_type}; feature input={Path(options.feature_table).resolve()}; '
+        f'transcript input={Path(options.quantitation_matrix).resolve()}')
     if options.mr_memory_gb is not None and (not np.isfinite(options.mr_memory_gb) or options.mr_memory_gb <= 0):
         raise ValueError('--mr-memory-gb must be a positive finite number (GiB).')
     if options.mr_storage == 'ram' and options.mr_memory_gb is None:
@@ -456,12 +484,30 @@ def main(options):
             '(additional index, p-value and SQL buffers required)')
         del transcripts, features
     # Job-unique scratch files and a single database writer avoid concurrent worker writes.
-    with tempfile.TemporaryDirectory(prefix='corrMO_', dir=options.scratch_dir) as directory, \
-            sqlite3.connect(str(Path(directory) / 'ranks.sqlite') if options.mr_storage == 'disk' else ':memory:') as scratch, \
-            sqlite3.connect(options.sqlite_db_name, timeout=60) as output:
-        scratch.execute('PRAGMA cache_size=-262144')
-        scratch.execute('PRAGMA temp_store=FILE')
+    with tempfile.TemporaryDirectory(prefix='corrMO_', dir=options.scratch_dir) as directory, ExitStack() as connections:
+        rank_path = Path(directory) / 'ranks.sqlite'
+        scratch = None
         if do_mr and options.mr_storage == 'disk':
+            scratch = sqlite3.connect(str(rank_path))
+            connections.callback(scratch.close)
+            connections.enter_context(scratch)
+        output = sqlite3.connect(options.sqlite_db_name, timeout=60)
+        connections.callback(output.close)
+        connections.enter_context(output)
+        if do_mr:
+            if options.mr_storage == 'disk':
+                log(f'DISK ranking database={rank_path}')
+            else:
+                log('RAM ranking uses NumPy arrays; no scratch ranking database is opened.')
+            log(f'Persistent correlation/MR/weight output={Path(options.sqlite_db_name).resolve()}; '
+                f'ClusterONE intermediates={directory}')
+        if scratch is not None:
+            scratch.execute('PRAGMA cache_size=-262144')
+            scratch.execute('PRAGMA temp_store=FILE')
+            # Only disposable, job-local ranks use these settings. Leave the
+            # persistent output database's durability settings untouched.
+            scratch.execute('PRAGMA journal_mode=OFF')
+            scratch.execute('PRAGMA synchronous=OFF')
             scratch.execute('CREATE TABLE edges (a INTEGER, b INTEGER, correlation REAL)')
         edge_chunks = []
         prefix = options.sqlite_table_name

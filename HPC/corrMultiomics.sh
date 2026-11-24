@@ -38,12 +38,18 @@ trap 'rm -rf -- "$job_scratch"' EXIT
 export SQLITE_TMPDIR="$job_scratch"
 
 # Select at submission time, e.g. sbatch --export=ALL,MR_STORAGE=ram,MR_MEMORY_GB=20 corrMultiomics.sh
-mr_args=(--mr-storage "${MR_STORAGE:-disk}")
+mr_storage="${MR_STORAGE:-disk}"
+case "$mr_storage" in
+    ram|disk) ;;
+    *) printf 'Invalid MR_STORAGE: %s (use ram or disk)\n' "$mr_storage" >&2; exit 2 ;;
+esac
+hpc_args=(--mr-storage "$mr_storage")
 if [[ -n "${MR_MEMORY_GB:-}" ]]; then
-    mr_args+=(--mr-memory-gb "$MR_MEMORY_GB")
+    hpc_args+=(--mr-memory-gb "$MR_MEMORY_GB")
 fi
 
 printf 'Job=%s Node=%s CPUs=%s Start=%s\n' "$SLURM_JOB_ID" "$SLURM_JOB_NODELIST" "$SLURM_CPUS_PER_TASK" "$(date -Is)"
+printf 'Runner=%s MR_STORAGE=%s Scratch=%s\n' "$python_script" "$mr_storage" "$job_scratch"
 # Use the same file for both inputs to construct a unimodal coexpression network.
 # For metabolite vs transcript analysis, change only -ft to the metabolite matrix.
 # MR construction requires a new database, as in the standard runner.
@@ -53,6 +59,6 @@ srun --cpu-bind=cores /usr/bin/time -v python -u "$python_script" \
     -dn "$work_dir/drosophila_TR_${SLURM_JOB_ID}.sqlite" \
     -tn "droso_coex_${SLURM_JOB_ID}" \
     -mad -r -mr -cl -c 0.2 -mdr 10 25 \
-    -t "$SLURM_CPUS_PER_TASK" "${mr_args[@]}" --block-size 128 \
+    -t "$SLURM_CPUS_PER_TASK" "${hpc_args[@]}" --block-size 128 \
     --scratch-dir "$job_scratch" \
     --clusterone-jar "$script_dir/cluster_one-1.0.jar" --java-heap 8g -v
