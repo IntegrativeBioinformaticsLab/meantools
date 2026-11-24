@@ -156,3 +156,7 @@ cython_debug/
 # End of https://www.toptal.com/developers/gitignore/api/python,jupyternotebooks
 
 .DS_Store
+
+# Reproducible local network outputs (summaries and provenance remain visible).
+results/mutual_rank_correction_*/**/*.sqlite
+results/mutual_rank_correction_*/**/*.edges.txt
