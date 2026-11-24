@@ -8,6 +8,10 @@ import numpy as np
 from scipy import stats
 from multiprocessing import Pool, Manager
 import sqlite3
+import json
+import hashlib
+import tempfile
+from datetime import datetime, timezone
 from multiprocessing.shared_memory import SharedMemory
 from multiprocessing.managers import SharedMemoryManager
 from tqdm import tqdm
@@ -110,12 +114,17 @@ def apply_MAD_filter(df):
 
 def main(Options):
 
+    if Options.mutual_rank:
+        if os.path.exists(Options.sqlite_db_name):
+            raise FileExistsError('MR construction requires a new output database; preserve the existing database.')
     script = os.path.dirname(os.path.abspath(__file__))
     pool = Pool(processes=Options.threads, maxtasksperchild=10)
     # smm = SharedMemoryManager()
     
     gizmos.validate_file_path(Options.feature_table, "feature table")
     gizmos.validate_file_path(Options.quantitation_matrix, "expression matrix")
+    network_type = mutual_ranks.network_type_from_inputs(
+        Options.feature_table, Options.quantitation_matrix)
 
     gizmos.print_milestone('Loading inputs...', Options.verbose)
 
@@ -180,10 +189,31 @@ def main(Options):
         all_objects = metabolites + genes
         all_objects = list(dict.fromkeys(all_objects))
         #
-        edges_df = mutual_ranks.get_MR_from_correlations(results_df, all_objects)
+        edges_df = mutual_ranks.get_MR_from_correlations(
+            results_df, all_objects, network_type=network_type)
+        provenance = mutual_ranks.ranking_provenance(network_type, options=vars(Options))
+        provenance['network_type_selection'] = 'same input file: unimodal; different input files: bipartite'
+        provenance['input_audit'] = edges_df.attrs['audit']
+        provenance['input_sha256'] = {}
+        for path in (Options.feature_table, Options.quantitation_matrix):
+            with open(path, 'rb') as handle:
+                provenance['input_sha256'][os.path.abspath(path)] = hashlib.sha256(handle.read()).hexdigest()
+        with open(__file__, 'rb') as handle:
+            provenance['caller_sha256'] = hashlib.sha256(handle.read()).hexdigest()
+        if Options.clusterone:
+            with open(os.path.join(script, 'cluster_one-1.0.jar'), 'rb') as handle:
+                provenance['clusterone_jar_sha256'] = hashlib.sha256(handle.read()).hexdigest()
+            provenance['clusterone_arguments'] = ['-F', 'csv']
+        provenance_df = pd.DataFrame([{
+            'created_utc': datetime.now(timezone.utc).isoformat(),
+            'provenance_json': json.dumps(provenance, sort_keys=True),
+        }])
+        gizmos.export_to_sql(Options.sqlite_db_name, provenance_df,
+                             Options.sqlite_table_name + '_MR_provenance', index=False)
         tablename = Options.sqlite_table_name + "_MR_edges"
         #edges_df.to_sql(tablename, conn, if_exists="append", index=False)
         gizmos.export_to_sql(Options.sqlite_db_name, edges_df, tablename, index = False)
+        mr_work = tempfile.TemporaryDirectory(prefix='meantools-mr-')
         
         #        
         #Kumar
@@ -197,7 +227,7 @@ def main(Options):
                 
                 tablename = Options.sqlite_table_name + "_MR_weights" + "_DR_{}".format(d)
                 
-                Options.weightsfile = os.path.join(script, 'sim_weights_DR_{}_file.csv'.format(d))
+                Options.weightsfile = os.path.join(mr_work.name, 'sim_weights_DR_{}_file.csv'.format(d))
                 
                 print('Writing mutual ranks with decay rate of {} to the database...'.format(d))
                 #weights_df.to_sql(tablename, conn, if_exists="append", index=False)
@@ -205,12 +235,13 @@ def main(Options):
                 del weights_df['MR']
                 
                 #write the weights data to a file to be read later by ClusterOne
-                weights_df.to_csv(Options.weightsfile, index=False, header=False, sep=' ')
+                mutual_ranks.clusterone_edges(weights_df, network_type=network_type).to_csv(
+                    Options.weightsfile, index=False, header=False, sep=' ')
             
                 if Options.clusterone:
                     
                     Options.clusteronepath = os.path.join(script, 'cluster_one-1.0.jar')
-                    Options.clusterone_outputfile = os.path.join(script, 'clusterOne_DR_{}.csv'.format(d))
+                    Options.clusterone_outputfile = os.path.join(mr_work.name, 'clusterOne_DR_{}.csv'.format(d))
                     
                     print('Generating modules with the decay rate of {} using ClusterOne...'.format(d))
                     mutual_ranks.run_clusterone(Options.clusterone_outputfile, Options.clusteronepath, Options.weightsfile)
@@ -235,16 +266,17 @@ def main(Options):
 
             weights_df = mutual_ranks.get_weight_from_MR(edges_df, Options.edge_weight_cutoff, Options.decay_rate)
             tablename = Options.sqlite_table_name + "_MR_weights"
-            Options.weightsfile = os.path.join(script, 'sim_weights_file.csv')
+            Options.weightsfile = os.path.join(mr_work.name, 'sim_weights_file.csv')
             gizmos.print_milestone('Writing mutual ranks to the database...', Options.verbose)
             #weights_df.to_sql(tablename, conn, if_exists="append", index=False)
             gizmos.export_to_sql(Options.sqlite_db_name, weights_df, tablename, index = False)
             del weights_df['MR']
-            weights_df.to_csv(Options.weightsfile, index=False, header=False, sep=' ') 
+            mutual_ranks.clusterone_edges(weights_df, network_type=network_type).to_csv(
+                Options.weightsfile, index=False, header=False, sep=' ')
         
             if Options.clusterone:
                 Options.clusteronepath = os.path.join(script, 'cluster_one-1.0.jar')
-                Options.clusterone_outputfile = os.path.join(script, 'clusterOne_DR_{}.csv'.format(Options.decay_rate))
+                Options.clusterone_outputfile = os.path.join(mr_work.name, 'clusterOne_DR_{}.csv'.format(Options.decay_rate))
                 gizmos.print_milestone('Generating modules by clustering genes and metabolites using ClusterOne...', Options.verbose)
                 mutual_ranks.run_clusterone(Options.clusterone_outputfile, Options.clusteronepath, Options.weightsfile)
                 clone_out_df = pd.read_csv(Options.clusterone_outputfile)
@@ -254,6 +286,8 @@ def main(Options):
                 # remove the physical files (these are space-delimited files)
                 os.remove(Options.clusterone_outputfile)
                 os.remove(Options.weightsfile)
+
+        mr_work.cleanup()
 
 
 
